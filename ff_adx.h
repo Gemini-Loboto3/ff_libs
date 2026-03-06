@@ -586,6 +586,63 @@ static void ff_libs__f32_to_s16_batch(const float* src, int16_t* dst, size_t cou
 #endif /* FF_LIBS__F32_TO_S16_DEFINED */
 
 /* ============================================================================
+ * ff_adx__s16_to_f32_batch
+ * Convert count int16 samples to float in [-1, 1]. SIMD-accelerated.
+ * ============================================================================ */
+static void ff_adx__s16_to_f32_batch(const int16_t* src, float* dst, size_t count)
+{
+#if defined(FF_LIBS__SSE2)
+    {
+        /* SSE2: process 8 int16s per iteration -> 8 floats */
+        __m128 scale = _mm_set1_ps(1.0f / 32768.0f);
+        size_t i = 0;
+        size_t simd_end = count & ~(size_t)7;
+
+        for (; i < simd_end; i += 8) {
+            __m128i s16v  = _mm_loadu_si128((const __m128i*)(src + i));
+            /* Sign-extend int16 -> int32 using SSE2 (no PMOVSXWD until SSE4.1) */
+            __m128i sign  = _mm_srai_epi16(s16v, 15);      /* 0x0000 or 0xFFFF */
+            __m128i lo32  = _mm_unpacklo_epi16(s16v, sign); /* 4 x int32 */
+            __m128i hi32  = _mm_unpackhi_epi16(s16v, sign); /* 4 x int32 */
+            __m128 flo    = _mm_mul_ps(_mm_cvtepi32_ps(lo32), scale);
+            __m128 fhi    = _mm_mul_ps(_mm_cvtepi32_ps(hi32), scale);
+            _mm_storeu_ps(dst + i,     flo);
+            _mm_storeu_ps(dst + i + 4, fhi);
+        }
+        /* Scalar tail */
+        for (; i < count; i++)
+            dst[i] = src[i] * (1.0f / 32768.0f);
+    }
+#elif defined(FF_LIBS__NEON)
+    {
+        /* NEON: process 8 int16s per iteration -> 8 floats */
+        float32x4_t scale = vdupq_n_f32(1.0f / 32768.0f);
+        size_t i = 0;
+        size_t simd_end = count & ~(size_t)7;
+
+        for (; i < simd_end; i += 8) {
+            int16x8_t  s16v = vld1q_s16(src + i);
+            int32x4_t  lo32 = vmovl_s16(vget_low_s16(s16v));
+            int32x4_t  hi32 = vmovl_s16(vget_high_s16(s16v));
+            float32x4_t flo = vmulq_f32(vcvtq_f32_s32(lo32), scale);
+            float32x4_t fhi = vmulq_f32(vcvtq_f32_s32(hi32), scale);
+            vst1q_f32(dst + i,     flo);
+            vst1q_f32(dst + i + 4, fhi);
+        }
+        /* Scalar tail */
+        for (; i < count; i++)
+            dst[i] = src[i] * (1.0f / 32768.0f);
+    }
+#else
+    {
+        size_t i;
+        for (i = 0; i < count; i++)
+            dst[i] = src[i] * (1.0f / 32768.0f);
+    }
+#endif
+}
+
+/* ============================================================================
  * Memory helpers
  * ============================================================================ */
 static void* ff_adx__malloc(size_t sz, const ff_adx_allocation_callbacks* a) {
@@ -1539,11 +1596,8 @@ FF_ADX_API uint64_t ff_adx_read_pcm_frames_f32(ff_adx* pAdx,
 
         {
             size_t sample_count = (size_t)(got * pAdx->channels);
-            size_t i;
             float* dst = pBufferOut + totalRead * pAdx->channels;
-            for (i = 0; i < sample_count; i++) {
-                dst[i] = scratch[i] * (1.0f / 32768.0f);
-            }
+            ff_adx__s16_to_f32_batch(scratch, dst, sample_count);
         }
 
         totalRead += got;
@@ -2048,9 +2102,9 @@ FF_ADX_API uint64_t ff_aix_read_pcm_frames_f32(ff_aix* pAix, uint8_t streamIdx,
         uint64_t got   = ff_aix__read_s16(pAix, streamIdx, chunk, scratch);
         if (got == 0) break;
         {
-            size_t n = (size_t)(got * pAix->channels), k;
+            size_t n = (size_t)(got * pAix->channels);
             float* dst = pBufferOut + totalRead * pAix->channels;
-            for (k = 0; k < n; k++) dst[k] = scratch[k] * (1.0f / 32768.0f);
+            ff_adx__s16_to_f32_batch(scratch, dst, n);
         }
         totalRead += got;
     }
